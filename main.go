@@ -10,26 +10,14 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	flags "github.com/jessevdk/go-flags"
 	"github.com/kazeburo/mackerel-plugin-axslog/axslog"
-	"github.com/kazeburo/mackerel-plugin-axslog/jsonreader"
-	"github.com/kazeburo/mackerel-plugin-axslog/ltsvreader"
-	"github.com/kazeburo/mackerel-plugin-axslog/posreader"
 	"github.com/mackerelio/golib/pluginutil"
 
 	"github.com/pkg/errors"
 )
-
-var version string
-
-// MaxReadSizeJSON : Maximum size for read
-var MaxReadSizeJSON int64 = 500 * 1000 * 1000
-
-// MaxReadSizeLTSV : Maximum size for read
-var MaxReadSizeLTSV int64 = 1000 * 1000 * 1000
 
 const (
 	maxScanTokenSize = 1 * 1024 * 1024 // 1MiB
@@ -38,10 +26,34 @@ const (
 
 var f0 = float64(0)
 
-// parseLog :
-var bracketByte = []byte("{")
+// Reader struct
+type Reader struct {
+	Pos    int64
+	reader io.Reader
+}
 
-func parseLog(bs *bufio.Scanner, r axslog.Reader, opts axslog.CmdOpts) (float64, int, error) {
+// New :
+func New(ir io.Reader, pos int64) (*Reader, error) {
+	if is, ok := ir.(io.Seeker); ok {
+		_, err := is.Seek(pos, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Reader{
+		Pos:    pos,
+		reader: ir,
+	}, nil
+}
+
+// Read :
+func (r *Reader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.Pos += int64(n)
+	return n, err
+}
+
+func parseLog(bs *bufio.Scanner, r axslog.Reader, opts axslog.CmdOpts) (float64, error) {
 	filter := []byte(opts.Filter)
 	for bs.Scan() {
 		b := bs.Bytes()
@@ -50,50 +62,25 @@ func parseLog(bs *bufio.Scanner, r axslog.Reader, opts axslog.CmdOpts) (float64,
 				continue
 			}
 		}
-		if opts.SkipUntilBracket {
-			i := bytes.Index(b, bracketByte)
-			if i > 0 {
-				b = b[i:]
-			}
-		}
-		c, pt, st := r.Parse(b)
-		if c&axslog.PtimeFlag == 0 {
-			log.Printf("No ptime. continue key:%s", opts.PtimeKey)
-			continue
-		}
-		if c&axslog.StatusFlag == 0 {
-			log.Printf("No status. continue key:%v", opts.StatusKeys)
-			continue
-		}
-		ptime, err := axslog.BFloat64(pt)
+		_, pt1, pt2 := r.Parse(b)
+		ptime1, err := axslog.BFloat64(pt1)
+		ptime2, err := axslog.BFloat64(pt2)
 		if err != nil {
 			log.Printf("Failed to convert ptime. continue: %v", err)
 			continue
 		}
-		status, err := axslog.BInt(st)
-		if err != nil {
-			log.Printf("Failed to convert status. continue: %v", err)
-			continue
-		}
-		return ptime, status, nil
+		return (ptime1 - ptime2), nil
 	}
 	if bs.Err() != nil {
-		return float64(0), int(0), bs.Err()
+		return float64(0), bs.Err()
 	}
-	return float64(0), int(0), io.EOF
+	return float64(0), io.EOF
 }
 
 // parseFile :
 func parseFile(logFile string, lastPos int64, opts axslog.CmdOpts, posFile string, stats *axslog.Stats) (float64, error) {
 	maxReadSize := int64(0)
-	switch opts.Format {
-	case "ltsv":
-		maxReadSize = MaxReadSizeLTSV
-	case "json":
-		maxReadSize = MaxReadSizeJSON
-	default:
-		return f0, fmt.Errorf("format %s is not supported", opts.Format)
-	}
+	maxReadSize = MaxReadSizeLTSV
 
 	stat, err := os.Stat(logFile)
 	if err != nil {
@@ -122,31 +109,26 @@ func parseFile(logFile string, lastPos int64, opts axslog.CmdOpts, posFile strin
 		return f0, errors.Wrap(err, "failed to open log file")
 	}
 	defer f.Close()
-	fpr, err := posreader.New(f, lastPos)
+	fpr, err := New(f, lastPos)
 	if err != nil {
 		return f0, errors.Wrap(err, "failed to seek log file")
 	}
 
 	var ar axslog.Reader
-	switch opts.Format {
-	case "ltsv":
-		ar = ltsvreader.New(opts.PtimeKey, opts.StatusKeys)
-	case "json":
-		ar = jsonreader.New(opts.PtimeKey, opts.StatusKeys)
-	}
+	ar = NewLTSV(opts.RequestTime, opts.UpstreamTime)
 
 	total := 0
 	bs := bufio.NewScanner(fpr)
 	bs.Buffer(make([]byte, startBufSize), maxScanTokenSize)
 	for {
-		ptime, status, errb := parseLog(bs, ar, opts)
+		ptime, errb := parseLog(bs, ar, opts)
 		if errb == io.EOF {
 			break
 		}
 		if errb != nil {
 			return f0, errors.Wrap(errb, "Something wrong in parse log")
 		}
-		stats.Append(ptime, status)
+		stats.Append(ptime)
 		total++
 	}
 
@@ -164,11 +146,11 @@ func parseFile(logFile string, lastPos int64, opts axslog.CmdOpts, posFile strin
 }
 
 func getFileStats(opts axslog.CmdOpts, posFile, logFile string) (*axslog.Stats, error) {
-	stats := axslog.NewStats()
 	lastPos := int64(0)
 	lastFstat := &axslog.FStat{}
 	startTime := float64(0)
 	endTime := float64(0)
+	stats := axslog.NewStats()
 
 	if axslog.FileExists(posFile) {
 		l, s, f, err := axslog.ReadPos(posFile)
@@ -296,32 +278,13 @@ func getStats(opts axslog.CmdOpts) error {
 		}
 	}
 
-	axslog.DisplayAll(statsAll, opts.KeyPrefix)
 	return nil
-}
-
-func printVersion() {
-	fmt.Printf(`%s %s
-Compiler: %s %s
-`,
-		os.Args[0],
-		version,
-		runtime.Compiler,
-		runtime.Version())
-}
-
-func main() {
-	os.Exit(_main())
 }
 
 func _main() int {
 	opts := axslog.CmdOpts{}
 	psr := flags.NewParser(&opts, flags.HelpFlag|flags.PassDoubleDash)
 	_, err := psr.Parse()
-	if opts.Version {
-		printVersion()
-		return 0
-	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
@@ -332,4 +295,8 @@ func _main() int {
 		return 1
 	}
 	return 0
+}
+
+func main() {
+	os.Exit(_main())
 }
